@@ -1,5 +1,6 @@
 use action_log::ActionLog;
 use agent_client_protocol::schema as acp;
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
@@ -11,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use util::markdown::MarkdownCodeBlock;
 
@@ -141,11 +143,53 @@ async fn read_global_skill_file(
     Ok(result_text.into())
 }
 
+/// Read an arbitrary file directly via the filesystem, bypassing
+/// project/worktree resolution. Used when the path is outside any worktree
+/// but the user has granted permission via `tool_permissions`.
+async fn read_external_file(
+    abs_path: &Path,
+    fs: &dyn fs::Fs,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    requested_path: &str,
+    event_stream: &ToolCallEventStream,
+) -> Result<LanguageModelToolResultContent, LanguageModelToolResultContent> {
+    let content = fs.load(abs_path).await.map_err(tool_content_err)?;
+
+    event_stream.update_fields(acp::ToolCallUpdateFields::new().locations(vec![
+        acp::ToolCallLocation::new(abs_path)
+            .line(start_line.map(|line| line.saturating_sub(1))),
+    ]));
+
+    let (raw_text, first_line_number) = if start_line.is_some() || end_line.is_some() {
+        let (start, end) = resolve_line_range(start_line, end_line);
+        let lines: Vec<&str> = content.split_inclusive('\n').collect();
+        let start_idx = (start as usize).saturating_sub(1).min(lines.len());
+        let end_idx = (end as usize).min(lines.len()).max(start_idx);
+        (lines[start_idx..end_idx].concat(), start)
+    } else {
+        (content, 1)
+    };
+
+    let result_text = format_with_line_numbers(&raw_text, first_line_number);
+
+    let markdown = MarkdownCodeBlock {
+        tag: requested_path,
+        text: &result_text,
+    }
+    .to_string();
+    event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+        acp::ToolCallContent::Content(acp::Content::new(markdown)),
+    ]));
+
+    Ok(result_text.into())
+}
+
 use super::tool_permissions::{
     ResolvedProjectPath, authorize_symlink_access, canonicalize_worktree_roots,
     resolve_global_skill_path, resolve_project_path,
 };
-use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
+use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext, ToolPermissionDecision, decide_permission_for_path, outline};
 
 /// Reads the content of the given file in the project.
 ///
@@ -156,7 +200,9 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
 /// - This tool supports reading image files. Supported formats: PNG, JPEG, WebP, GIF, BMP, TIFF.
 ///   Image files are returned as visual content that you can analyze directly.
 ///
-/// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+/// The only supported path outside the project is `~/.agents/skills`, for global agent skills.
+/// External paths outside any worktree are also supported when the `read_file` tool is
+/// allowed via `tool_permissions`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileToolInput {
     /// The relative path of the file to read.
@@ -275,20 +321,102 @@ impl AgentTool for ReadFileTool {
                 .await;
             }
 
+            // Check tool_permissions first — before project-path resolution —
+            // so that allow/deny decisions apply even for paths outside any
+            // worktree.
+            let decision = cx.update(|cx| {
+                decide_permission_for_path(
+                    Self::NAME,
+                    &input.path,
+                    &AgentSettings::get_global(cx),
+                )
+            });
+
+            if let ToolPermissionDecision::Deny(reason) = decision {
+                return Err(tool_content_err(reason));
+            }
+
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
 
-            let (project_path, symlink_canonical_target) =
-                project.read_with(cx, |project, cx| {
-                    let resolved =
-                        resolve_project_path(project, &input.path, &canonical_roots, cx)?;
-                    anyhow::Ok(match resolved {
-                        ResolvedProjectPath::Safe(path) => (path, None),
-                        ResolvedProjectPath::SymlinkEscape {
-                            project_path,
-                            canonical_target,
-                        } => (project_path, Some(canonical_target)),
-                    })
-                }).map_err(tool_content_err)?;
+            let resolution = project.read_with(cx, |project, cx| {
+                let resolved =
+                    resolve_project_path(project, &input.path, &canonical_roots, cx)?;
+                anyhow::Ok(match resolved {
+                    ResolvedProjectPath::Safe(path) => (path, None),
+                    ResolvedProjectPath::SymlinkEscape {
+                        project_path,
+                        canonical_target,
+                    } => (project_path, Some(canonical_target)),
+                })
+            });
+
+            let (project_path, symlink_canonical_target) = match resolution {
+                Ok(resolved) => resolved,
+                Err(resolve_err) => {
+                    // Path is outside any worktree. Allow iff tool_permissions
+                    // says so; confirm requires a prompt; deny was already
+                    // handled above.
+                    if matches!(decision, ToolPermissionDecision::Allow) {
+                        // Read directly via the filesystem.
+                        let abs_path = if Path::new(&input.path).is_absolute() {
+                            PathBuf::from(&input.path)
+                        } else {
+                            return Err(tool_content_err(resolve_err));
+                        };
+
+                        if fs.is_dir(&abs_path).await {
+                            return Err(tool_content_err(format!(
+                                "{} is a directory, not a file. Use the list_directory tool to explore directory contents.",
+                                &input.path
+                            )));
+                        }
+
+                        return read_external_file(
+                            &abs_path,
+                            fs.as_ref(),
+                            input.start_line,
+                            input.end_line,
+                            &input.path,
+                            &event_stream,
+                        )
+                        .await;
+                    }
+
+                    // Confirm mode: prompt the user before reading.
+                    let authorize = cx.update(|cx| {
+                        let context = ToolPermissionContext::new(
+                            Self::NAME,
+                            vec![input.path.clone()],
+                        );
+                        let title = format!("Read file `{}`", &input.path);
+                        event_stream.authorize(title, context, cx)
+                    });
+                    authorize.await.map_err(tool_content_err)?;
+
+                    let abs_path = if Path::new(&input.path).is_absolute() {
+                        PathBuf::from(&input.path)
+                    } else {
+                        return Err(tool_content_err(resolve_err));
+                    };
+
+                    if fs.is_dir(&abs_path).await {
+                        return Err(tool_content_err(format!(
+                            "{} is a directory, not a file.",
+                            &input.path
+                        )));
+                    }
+
+                    return read_external_file(
+                        &abs_path,
+                        fs.as_ref(),
+                        input.start_line,
+                        input.end_line,
+                        &input.path,
+                        &event_stream,
+                    )
+                    .await;
+                }
+            };
 
             let abs_path = project
                 .read_with(cx, |project, cx| {
@@ -341,14 +469,26 @@ impl AgentTool for ReadFileTool {
             }
 
             if let Some(canonical_target) = &symlink_canonical_target {
+                if !matches!(decision, ToolPermissionDecision::Allow) {
+                    let authorize = cx.update(|cx| {
+                        authorize_symlink_access(
+                            Self::NAME,
+                            &input.path,
+                            canonical_target,
+                            &event_stream,
+                            cx,
+                        )
+                    });
+                    authorize.await.map_err(tool_content_err)?;
+                }
+            } else if matches!(decision, ToolPermissionDecision::Confirm) {
                 let authorize = cx.update(|cx| {
-                    authorize_symlink_access(
+                    let context = ToolPermissionContext::new(
                         Self::NAME,
-                        &input.path,
-                        canonical_target,
-                        &event_stream,
-                        cx,
-                    )
+                        vec![input.path.clone()],
+                    );
+                    let title = format!("Read file `{}`", &input.path);
+                    event_stream.authorize(title, context, cx)
                 });
                 authorize.await.map_err(tool_content_err)?;
             }
@@ -1005,6 +1145,13 @@ mod test {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+        // Default to Allow so existing tests that don't set up
+        // tool_permissions keep passing unchanged.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            AgentSettings::override_global(settings, cx);
+        });
     }
 
     fn single_pixel_png() -> Vec<u8> {
@@ -1071,7 +1218,16 @@ mod test {
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let tool = Arc::new(ReadFileTool::new(project, action_log, true));
 
-        // Reading a file outside the project worktree should fail
+        // Restore Allow after SettingsStore::update_global recompute.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            AgentSettings::override_global(settings, cx);
+        });
+
+        // Reading a file outside the project worktree with Allow permissions
+        // now succeeds — external-path access is gated by tool_permissions,
+        // not a hard block.
         let result = cx
             .update(|cx| {
                 let input = ReadFileToolInput {
@@ -1087,8 +1243,8 @@ mod test {
             })
             .await;
         assert!(
-            result.is_err(),
-            "read_file_tool should error when attempting to read an absolute path outside a worktree"
+            result.is_ok(),
+            "read_file with Allow mode should read files outside worktrees: {result:?}"
         );
 
         // Reading a file within the project should succeed
@@ -1250,6 +1406,12 @@ mod test {
     #[gpui::test]
     async fn test_read_image_symlink_requires_authorization(cx: &mut TestAppContext) {
         init_test(cx);
+        // Image symlink test must run in Confirm mode.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            AgentSettings::override_global(settings, cx);
+        });
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/root"), json!({})).await;
@@ -1374,6 +1536,13 @@ mod test {
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let tool = Arc::new(ReadFileTool::new(project.clone(), action_log.clone(), true));
+
+        // Restore Allow after SettingsStore::update_global recompute.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            AgentSettings::override_global(settings, cx);
+        });
 
         // Test reading allowed files in worktree1
         let result = cx
@@ -1534,6 +1703,13 @@ mod test {
     #[gpui::test]
     async fn test_read_file_symlink_escape_requests_authorization(cx: &mut TestAppContext) {
         init_test(cx);
+        // Symlink-escape tests must run in Confirm mode so that the
+        // authorization prompt is triggered.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            AgentSettings::override_global(settings, cx);
+        });
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -1596,6 +1772,12 @@ mod test {
     #[gpui::test]
     async fn test_read_file_symlink_escape_denied(cx: &mut TestAppContext) {
         init_test(cx);
+        // Symlink-escape tests must run in Confirm mode.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            AgentSettings::override_global(settings, cx);
+        });
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -2006,6 +2188,13 @@ mod test {
     #[gpui::test]
     async fn test_read_outside_skills_dir_still_rejected(cx: &mut TestAppContext) {
         init_test(cx);
+        // Deny mode keeps the original behaviour: paths outside any worktree
+        // that are not under the skills directory are rejected.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Deny;
+            AgentSettings::override_global(settings, cx);
+        });
 
         // A path that's neither in the worktree nor under the global skills
         // dir should still fail — the fast path is gated, not a backdoor for
@@ -2038,6 +2227,373 @@ mod test {
         assert!(
             result.is_err(),
             "path outside skills dir should be rejected"
+        );
+    }
+
+    // ── tool_permissions tests ──
+
+    fn init_test_with_permission(cx: &mut TestAppContext, mode: settings::ToolPermissionMode) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.tools.insert(
+                "read_file".into(),
+                agent_settings::ToolRules {
+                    default: Some(mode),
+                    ..Default::default()
+                },
+            );
+            AgentSettings::override_global(settings, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_read_file_permission_deny(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Deny);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "file.txt": "hello"
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: "root/file.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.run(
+                    ToolInput::resolved(input),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(result.is_err(), "read_file should be denied: {result:?}");
+        let err = error_text(result.unwrap_err());
+        assert!(
+            err.contains("disabled"),
+            "expected 'disabled' in error, got: {err}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_permission_allow_no_auth(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Allow);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "file.txt": "hello world"
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let result = cx
+            .update(|cx| {
+                let input = ReadFileToolInput {
+                    path: "root/file.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                };
+                tool.run(
+                    ToolInput::resolved(input),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "read_file should succeed without auth: {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "     1\thello world".into()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_permission_confirm_requests_auth(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Confirm);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "file.txt": "hello world"
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let (event_stream, mut event_rx) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(ReadFileToolInput {
+                    path: "root/file.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        // Confirm mode should pop up an authorization prompt
+        let auth = event_rx.expect_authorization().await;
+        let title = auth.tool_call.fields.title.as_deref().unwrap_or("");
+        assert!(
+            title.contains("Read file"),
+            "title should mention read file, got: {title}"
+        );
+
+        auth.response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .unwrap();
+
+        let result = task.await;
+        assert!(
+            result.is_ok(),
+            "read_file should succeed after approval: {result:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_symlink_allow_no_auth(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Allow);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    "src": { "main.rs": "fn main() {}" }
+                },
+                "external": {
+                    "cache.txt": "cached data"
+                }
+            }),
+        )
+        .await;
+
+        fs.create_symlink(
+            path!("/root/project/cache_link.txt").as_ref(),
+            PathBuf::from("../external/cache.txt"),
+        )
+        .await
+        .unwrap();
+
+        let project =
+            Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        // In allow mode the tool should succeed without authorization,
+        // even for a symlink escape. Using test() without event_rx capture
+        // would deadlock if the tool unexpectedly requests authorization.
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "project/cache_link.txt".into(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "read_file should succeed for symlink with allow: {result:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_symlink_confirm_requests_auth(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Confirm);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    "src": { "main.rs": "fn main() {}" }
+                },
+                "external": {
+                    "cache.txt": "cached data"
+                }
+            }),
+        )
+        .await;
+
+        fs.create_symlink(
+            path!("/root/project/cache_link.txt").as_ref(),
+            PathBuf::from("../external/cache.txt"),
+        )
+        .await
+        .unwrap();
+
+        let project =
+            Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let (event_stream, mut event_rx) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.clone().run(
+                ToolInput::resolved(ReadFileToolInput {
+                    path: "project/cache_link.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                }),
+                event_stream,
+                cx,
+            )
+        });
+
+        // Confirm mode + symlink should pop up a symlink-specific auth prompt
+        let auth = event_rx.expect_authorization().await;
+        let title = auth.tool_call.fields.title.as_deref().unwrap_or("");
+        assert!(
+            title.contains("points outside the project"),
+            "symlink confirm should show symlink-escape prompt, got: {title}"
+        );
+
+        auth.response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .unwrap();
+
+        let result = task.await;
+        assert!(
+            result.is_ok(),
+            "read_file should succeed after symlink approval: {result:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_external_path_allow_succeeds(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Allow);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {}
+            }),
+        )
+        .await;
+        // Create a file outside the project worktree.
+        fs.insert_file(path!("/outside_file.txt"), b"external content".to_vec())
+            .await;
+
+        let project =
+            Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: path!("/outside_file.txt").to_string(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "read_file should succeed for external path with allow: {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "     1\texternal content".into()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_external_path_deny_fails(cx: &mut TestAppContext) {
+        init_test_with_permission(cx, settings::ToolPermissionMode::Deny);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {}
+            }),
+        )
+        .await;
+        fs.insert_file(path!("/outside_file.txt"), b"secret".to_vec())
+            .await;
+
+        let project =
+            Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: path!("/outside_file.txt").to_string(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "read_file should be denied for external path with deny mode"
+        );
+        let err = error_text(result.unwrap_err());
+        assert!(
+            err.contains("disabled"),
+            "expected 'disabled' in error, got: {err}"
         );
     }
 }
